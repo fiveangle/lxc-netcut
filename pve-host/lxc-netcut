@@ -1,0 +1,54 @@
+#!/bin/bash
+# Temporarily take down an LXC container's network link(s).
+# Usage: lxc-netcut <ctid> <nets> <seconds>
+#   ctid and nets are fixed by the forced command in netcut's authorized_keys;
+#   only seconds comes from the agent. nets is "all" or a comma list of netN indexes.
+set -euo pipefail
+shopt -s nullglob
+
+MAX=600
+
+# Refusals are logged too, so the journal shows every request
+die() { logger -t lxc-netcut "CT ${CTID:-?}: refused: $2"; echo "$2" >&2; exit "$1"; }
+
+[[ $# -eq 3 ]] || die 2 "usage: <seconds 1-$MAX>"
+CTID=$1 NETS=$2 ARG=$3
+[[ $CTID =~ ^[1-9][0-9]{2,8}$ ]] || die 1 "bad container id in key config"
+[[ $NETS =~ ^(all|[0-9]{1,2}(,[0-9]{1,2})*)$ ]] || die 1 "bad net list in key config"
+[[ $ARG =~ ^[0-9]{1,5}$ ]] || die 2 "usage: <seconds 1-$MAX>"
+SECS=$((10#$ARG))
+(( SECS >= 1 && SECS <= MAX )) || die 2 "seconds must be 1-$MAX"
+[[ -f /etc/pve/lxc/$CTID.conf ]] || die 1 "CT $CTID is not an LXC container on this node"
+
+# Host side of netN is veth<ctid>i<N>
+ifaces=()
+if [[ $NETS == all ]]; then
+  for p in /sys/class/net/veth${CTID}i*; do ifaces+=("${p##*/}"); done
+else
+  IFS=, read -ra idx <<< "$NETS"
+  for n in "${idx[@]}"; do
+    i="veth${CTID}i$((10#$n))"
+    [[ -e /sys/class/net/$i ]] || die 1 "CT $CTID interface $i not present (is the container running?)"
+    ifaces+=("$i")
+  done
+fi
+(( ${#ifaces[@]} )) || die 1 "CT $CTID has no veth interfaces (is the container running?)"
+
+UNIT="lxc-netcut-$CTID"
+systemctl is-active --quiet "$UNIT" && die 1 "an outage is already in progress for CT $CTID"
+
+# Each ExecStopPost runs however the unit ends; "-" keeps one failure from skipping the rest
+down="sleep 2"
+props=()
+for i in "${ifaces[@]}"; do
+  down+="; /usr/sbin/ip link set $i down"
+  props+=(-p "ExecStopPost=-/usr/sbin/ip link set $i up")
+done
+
+systemd-run --quiet --collect --unit="$UNIT" \
+  -p RuntimeMaxSec=$((SECS + 30)) "${props[@]}" \
+  /bin/sh -c "$down; sleep $SECS" \
+  || die 1 "failed to start outage for CT $CTID"
+
+logger -t lxc-netcut "CT $CTID: ${ifaces[*]} down for ${SECS}s (requested via ssh)"
+echo "CT $CTID network (${ifaces[*]}) going down in 2s for ${SECS}s"

@@ -1,0 +1,108 @@
+#!/bin/bash
+# Manage which containers may trigger lxc-netcut. Run as root on the PVE host.
+#   netcut-admin add <ctid> <pubkey | pubkey-file> [all | 0,1,...]
+#   netcut-admin remove <ctid>
+#   netcut-admin list
+set -euo pipefail
+
+AUTH=/home/netcut/.ssh/authorized_keys
+LOCK=/run/netcut-admin.lock
+
+die() { echo "$*" >&2; exit 1; }
+# Registration changes are logged, since they decide who can cut a network
+audit() { logger -t netcut-admin "$* (by ${SUDO_USER:-root})"; }
+usage() { sed -n '3,5s/^# \{0,3\}//p' "$0" >&2; exit 2; }
+
+valid_ctid() { [[ $1 =~ ^[1-9][0-9]{2,8}$ ]] || die "invalid container id: $1"; }
+
+# Static ip=/ip6= addresses of every netN in the CT's current (not pending) config
+# (dhcp/auto/manual skipped)
+ct_ips() {
+  local _ opts opt
+  while read -r _ opts; do
+    IFS=, read -ra opts <<< "$opts"
+    for opt in "${opts[@]}"; do
+      case $opt in
+        ip=* | ip6=*)
+          opt=${opt#*=}
+          opt=${opt%%/*}
+          [[ $opt =~ ^[0-9a-fA-F:.]+$ ]] && echo "$opt"
+          ;;
+      esac
+    done
+  done < <(pct config "$1" --current 1 | grep -E '^net[0-9]+:')
+}
+
+# Rewrite authorized_keys without CT $1's line, plus any extra lines from stdin
+rewrite() {
+  local tmp
+  tmp=$(mktemp "$AUTH.XXXXXX")
+  { grep -v " netcut-ct$1\$" "$AUTH" || true; cat; } > "$tmp"
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$AUTH"
+}
+
+cmd_add() {
+  [[ $# -eq 2 || $# -eq 3 ]] || usage
+  local ctid=$1 key=$2 nets=${3:-all} type blob from
+  valid_ctid "$ctid"
+  [[ $nets =~ ^(all|[0-9]{1,2}(,[0-9]{1,2})*)$ ]] || die "nets must be 'all' or a list like 0,1"
+  [[ -f /etc/pve/lxc/$ctid.conf ]] || die "CT $ctid is not an LXC container on this node"
+
+  # sshd will accept the key only from these addresses
+  from=$(ct_ips "$ctid" | paste -sd,)
+  [[ -n $from ]] || die "CT $ctid has no static ip= or ip6= in its network config"
+
+  [[ -f $key ]] && key=$(<"$key")
+  read -r type blob _ <<< "$key"
+  [[ $type =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$ ]] \
+    || die "expected a public key starting with its type, e.g. ssh-ed25519 AAAA..."
+  ssh-keygen -l -f - <<< "$type $blob" >/dev/null 2>&1 || die "not a valid public key"
+  if grep -F " $blob " "$AUTH" | grep -qv " netcut-ct$ctid\$"; then
+    die "this key is already registered for another container"
+  fi
+
+  printf 'from="%s",command="sudo -n /usr/local/sbin/lxc-netcut %s %s \\"$SSH_ORIGINAL_COMMAND\\"",restrict %s %s netcut-ct%s\n' \
+    "$from" "$ctid" "$nets" "$type" "$blob" "$ctid" | rewrite "$ctid"
+  audit "CT $ctid registered: nets=$nets from=$from key=$(ssh-keygen -l -f - <<< "$type $blob" | awk '{print $2}')"
+  echo "CT $ctid (nets: $nets, from: $from) can now trigger outages"
+}
+
+cmd_remove() {
+  [[ $# -eq 1 ]] || usage
+  valid_ctid "$1"
+  grep -q " netcut-ct$1\$" "$AUTH" || die "CT $1 is not registered"
+  rewrite "$1" < /dev/null
+  audit "CT $1 removed"
+  echo "CT $1 removed"
+}
+
+cmd_list() {
+  [[ $# -eq 0 ]] || usage
+  local line ctid nets type blob fp from
+  printf '%-10s %-8s %-52s %s\n' CTID NETS KEY FROM
+  while read -r line; do
+    [[ $line =~ ^from=\"([^\"]+)\",.*lxc-netcut\ ([0-9]+)\ ([^ ]+)\ .*,restrict\ ([^ ]+)\ ([^ ]+)\ netcut-ct ]] || continue
+    from=${BASH_REMATCH[1]} ctid=${BASH_REMATCH[2]} nets=${BASH_REMATCH[3]} type=${BASH_REMATCH[4]} blob=${BASH_REMATCH[5]}
+    fp=$(ssh-keygen -l -f - <<< "$type $blob" | awk '{print $2}')
+    printf '%-10s %-8s %-52s %s\n' "$ctid" "$nets" "$fp" "$from"
+  done < "$AUTH"
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ -f $AUTH ]] || die "$AUTH not found; run install.sh first"
+[[ $# -ge 1 ]] || usage
+
+# Root-only dir, and >> so an existing file is never truncated
+exec 9>> "$LOCK"
+flock 9
+
+cmd=$1
+shift
+case $cmd in
+  add) cmd_add "$@" ;;
+  remove) cmd_remove "$@" ;;
+  list) cmd_list "$@" ;;
+  *) usage ;;
+esac
